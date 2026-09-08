@@ -1,5 +1,7 @@
 # SimpleRAG: Local Ollama-powered RAG App using Streamlit
 
+https://simplerag-nu89u5r64ow9ywxuhxbra6.streamlit.app/
+
 ## Overview
 
 SimpleRAG is an educational project that demonstrates the implementation of a Retrieval-Augmented Generation (RAG) system using Streamlit and Ollama. It allows users to upload documents, process them, and then engage in a chat interface to ask questions about the content of these documents.
