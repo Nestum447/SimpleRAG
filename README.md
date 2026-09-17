@@ -1,6 +1,6 @@
 # SimpleRAG: Local Ollama-powered RAG App using Streamlit
 
-https://simplerag-nu89u5r64ow9ywxuhxbra6.streamlit.app/
+https://simplerag-h4hae2vqg6hsubxqb48vtf.streamlit.app/
 
 ## Overview
 
