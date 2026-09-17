@@ -1,22 +1,22 @@
 import streamlit as st
 import os
-import time
-from pathlib import Path
-import chromadb
-import requests
 import json
+import hashlib
+import re
+import io
+from pathlib import Path
+from typing import List, Dict, Tuple
+
+import requests
+import chromadb
 import PyPDF2
 import docx
 import openpyxl
 import chardet
-from typing import List, Dict, Union
-import io
-import re
-import hashlib
 
 
 # ============================================================
-# PAGE CONFIG
+# CONFIGURACIÓN
 # ============================================================
 
 st.set_page_config(
@@ -25,198 +25,124 @@ st.set_page_config(
     layout="wide"
 )
 
+# Ollama Cloud
+OLLAMA_CLOUD_URL = "https://ollama.com"
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# Modelos Cloud
+# Puedes cambiarlos si tienes otro modelo disponible.
+DEFAULT_CHAT_MODEL = "gpt-oss:20b"
+DEFAULT_EMBEDDING_MODEL = "qwen3-embedding"
 
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-
+# RAG
 DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_CHUNK_OVERLAP = 200
-DEFAULT_NUM_CHUNKS = 4
+DEFAULT_CHUNK_OVERLAP = 150
+DEFAULT_NUM_CHUNKS = 5
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MEMORY_SIZE = 3
 
+# Límites para evitar que Streamlit Cloud tarde demasiado
+MAX_FILE_SIZE_MB = 25
+MAX_SUMMARY_CHARS = 12000
+
 
 # ============================================================
-# GET OLLAMA URL
+# OLLAMA CLOUD
 # ============================================================
 
-def get_ollama_url():
+def get_ollama_api_key():
+    """
+    Obtiene la API Key desde Streamlit Secrets.
+    Si no existe, intenta obtenerla desde variables de entorno.
+    """
 
-    # Streamlit Cloud / Secrets
     try:
-        if "OLLAMA_URL" in st.secrets:
-            return st.secrets["OLLAMA_URL"].rstrip("/")
+        key = st.secrets.get("OLLAMA_API_KEY")
+
+        if key:
+            return key
     except Exception:
         pass
 
-    # Environment variable
-    env_url = os.getenv("OLLAMA_URL")
-
-    if env_url:
-        return env_url.rstrip("/")
-
-    # Local development
-    return DEFAULT_OLLAMA_URL
+    return os.getenv("OLLAMA_API_KEY")
 
 
-# ============================================================
-# PROMPT
-# ============================================================
+def get_ollama_headers():
+    """
+    Headers necesarios para Ollama Cloud.
+    """
 
-DEFAULT_PROMPT_TEMPLATE = """Here are the chunks retrieved based on similarity search from user's question.
-They might or might not be directly related to the question:
+    api_key = get_ollama_api_key()
 
-{context}
+    if not api_key:
+        return None
 
-Document Summaries:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
 
-{summaries}
 
-Chat History:
+def validate_ollama_key():
+    """
+    Verifica que exista la API Key.
+    No realiza llamadas innecesarias a /api/tags.
+    """
 
-{memory}
+    key = get_ollama_api_key()
 
-User Question:
+    if not key:
+        return False, "No se encontró OLLAMA_API_KEY en Streamlit Secrets."
 
-{question}
-
-Please provide a comprehensive answer to the user's question based on the given context,
-document summaries, and chat history.
-
-If the information is not available in the provided context,
-please state that you don't have enough information to answer the question.
-
-Your Answer:"""
+    return True, "API Key encontrada."
 
 
 # ============================================================
-# OLLAMA CONNECTION
+# OLLAMA CHAT
 # ============================================================
 
-@st.cache_data(show_spinner=False)
-def check_ollama_connection(ollama_url: str) -> bool:
-
-    try:
-
-        response = requests.get(
-            f"{ollama_url}/api/tags",
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        return True
-
-    except requests.RequestException:
-
-        return False
-
-
-# ============================================================
-# GET MODELS
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def get_ollama_models(ollama_url: str) -> List[str]:
-
-    try:
-
-        response = requests.get(
-            f"{ollama_url}/api/tags",
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        return [
-            model["name"]
-            for model in data.get("models", [])
-        ]
-
-    except requests.RequestException as e:
-
-        return []
-
-
-# ============================================================
-# EMBEDDINGS
-# ============================================================
-
-def embed_documents(
-    ollama_url: str,
-    model: str,
-    texts: List[str]
-):
-
-    embeddings = []
-
-    for text in texts:
-
-        try:
-
-            response = requests.post(
-                f"{ollama_url}/api/embeddings",
-                json={
-                    "model": model,
-                    "prompt": text
-                },
-                timeout=120
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            embedding = data.get("embedding")
-
-            if not embedding:
-
-                st.error(
-                    "Ollama did not return an embedding."
-                )
-
-                return None
-
-            embeddings.append(embedding)
-
-        except requests.RequestException as e:
-
-            st.error(
-                f"Error getting embedding: {str(e)}"
-            )
-
-            return None
-
-    return embeddings
-
-
-# ============================================================
-# CHAT WITH OLLAMA
-# ============================================================
-
-def chat_with_documents(
-    ollama_url: str,
+def ollama_chat(
     model: str,
     prompt: str,
-    temperature: float
+    temperature: float = 0.1,
+    stream: bool = False
 ):
+    """
+    Llama directamente a Ollama Cloud.
+
+    Endpoint:
+        https://ollama.com/api/chat
+    """
+
+    headers = get_ollama_headers()
+
+    if not headers:
+        st.error(
+            "No se encontró OLLAMA_API_KEY. "
+            "Agrega OLLAMA_API_KEY en Streamlit Secrets."
+        )
+        return None
+
+    url = f"{OLLAMA_CLOUD_URL}/api/chat"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": temperature,
+        "stream": stream
+    }
 
     try:
 
         response = requests.post(
-            f"{ollama_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "temperature": temperature,
-                "stream": True
-            },
-            stream=True,
+            url,
+            headers=headers,
+            json=payload,
+            stream=stream,
             timeout=300
         )
 
@@ -224,1390 +150,1604 @@ def chat_with_documents(
 
         return response
 
-    except requests.RequestException as e:
+    except requests.exceptions.HTTPError as e:
+
+        error_text = ""
+
+        try:
+            error_text = response.text[:1000]
+        except Exception:
+            pass
 
         st.error(
-            f"Error generating response: {str(e)}"
+            f"Error HTTP de Ollama Cloud: {e}\n\n"
+            f"{error_text}"
+        )
+
+        return None
+
+    except requests.exceptions.RequestException as e:
+
+        st.error(
+            f"No se pudo conectar con Ollama Cloud:\n{e}"
         )
 
         return None
 
 
 # ============================================================
-# FILE ENCODING
+# EMBEDDINGS
 # ============================================================
 
-def detect_encoding(file_content: bytes) -> str:
+def embed_texts(
+    model: str,
+    texts: List[str]
+):
+    """
+    Genera embeddings en una sola llamada usando /api/embed.
 
-    result = chardet.detect(file_content)
+    Esto es mucho más eficiente que hacer una petición HTTP
+    independiente para cada chunk.
+    """
 
-    encoding = result.get("encoding")
+    if not texts:
+        return []
 
-    return encoding or "utf-8"
+    headers = get_ollama_headers()
 
+    if not headers:
+        st.error("No existe OLLAMA_API_KEY.")
+        return None
 
-# ============================================================
-# READ FILE
-# ============================================================
+    url = f"{OLLAMA_CLOUD_URL}/api/embed"
 
-def read_file(
-    file: io.BytesIO,
-    filename: str
-) -> str:
-
-    _, file_extension = os.path.splitext(filename)
+    payload = {
+        "model": model,
+        "input": texts
+    }
 
     try:
 
-        # PDF
-        if file_extension.lower() == ".pdf":
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=300
+        )
 
-            pdf_reader = PyPDF2.PdfReader(file)
+        response.raise_for_status()
 
-            text_parts = []
+        data = response.json()
 
-            for page in pdf_reader.pages:
+        embeddings = data.get("embeddings")
 
-                page_text = page.extract_text()
+        if not embeddings:
 
-                if page_text:
-
-                    text_parts.append(page_text)
-
-            return "\n".join(text_parts)
-
-
-        # DOCX
-        elif file_extension.lower() == ".docx":
-
-            document = docx.Document(file)
-
-            return "\n".join(
-                paragraph.text
-                for paragraph in document.paragraphs
-                if paragraph.text
+            st.error(
+                "Ollama Cloud no devolvió embeddings."
             )
 
+            return None
 
-        # XLSX / XLS
-        elif file_extension.lower() in [".xlsx", ".xls"]:
+        return embeddings
 
-            workbook = openpyxl.load_workbook(
-                file,
-                data_only=True
-            )
+    except requests.exceptions.HTTPError as e:
 
-            values = []
+        error_text = ""
 
-            for sheet in workbook.worksheets:
+        try:
+            error_text = response.text[:1000]
+        except Exception:
+            pass
 
-                for row in sheet.iter_rows():
+        st.error(
+            f"Error HTTP generando embeddings:\n"
+            f"{e}\n\n"
+            f"{error_text}"
+        )
 
-                    for cell in row:
+        return None
 
-                        if cell.value is not None:
+    except requests.exceptions.RequestException as e:
 
-                            values.append(
-                                str(cell.value)
-                            )
+        st.error(
+            f"Error generando embeddings:\n{e}"
+        )
 
-            return "\n".join(values)
+        return None
 
 
-        # TXT / other
-        else:
+def embed_text(
+    model: str,
+    text: str
+):
+    """
+    Embedding de una sola consulta.
+    """
 
-            content = file.read()
+    result = embed_texts(
+        model,
+        [text]
+    )
 
-            encoding = detect_encoding(content)
+    if not result:
+        return None
 
-            return content.decode(
-                encoding,
-                errors="replace"
-            )
+    return result[0]
+
+
+# ============================================================
+# LECTURA DE ARCHIVOS
+# ============================================================
+
+def read_pdf(file):
+    text_parts = []
+
+    try:
+
+        reader = PyPDF2.PdfReader(file)
+
+        for page in reader.pages:
+
+            page_text = page.extract_text()
+
+            if page_text:
+                text_parts.append(page_text)
+
+        return "\n".join(text_parts)
 
     except Exception as e:
 
         st.error(
-            f"Error reading {filename}: {str(e)}"
+            f"Error leyendo PDF {file.name}: {e}"
         )
 
         return ""
 
 
+def read_docx(file):
+    try:
+
+        document = docx.Document(file)
+
+        paragraphs = [
+            p.text
+            for p in document.paragraphs
+            if p.text.strip()
+        ]
+
+        return "\n".join(paragraphs)
+
+    except Exception as e:
+
+        st.error(
+            f"Error leyendo DOCX {file.name}: {e}"
+        )
+
+        return ""
+
+
+def read_excel(file):
+    try:
+
+        workbook = openpyxl.load_workbook(
+            file,
+            read_only=True,
+            data_only=True
+        )
+
+        text_parts = []
+
+        for sheet in workbook.worksheets:
+
+            text_parts.append(
+                f"\n--- HOJA: {sheet.title} ---\n"
+            )
+
+            for row in sheet.iter_rows(values_only=True):
+
+                values = [
+                    str(value)
+                    for value in row
+                    if value is not None
+                ]
+
+                if values:
+                    text_parts.append(
+                        " | ".join(values)
+                    )
+
+        return "\n".join(text_parts)
+
+    except Exception as e:
+
+        st.error(
+            f"Error leyendo Excel {file.name}: {e}"
+        )
+
+        return ""
+
+
+def read_text_file(file):
+
+    try:
+
+        raw_data = file.read()
+
+        detected = chardet.detect(raw_data)
+
+        encoding = detected.get(
+            "encoding",
+            "utf-8"
+        )
+
+        return raw_data.decode(
+            encoding,
+            errors="replace"
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Error leyendo {file.name}: {e}"
+        )
+
+        return ""
+
+
+def read_uploaded_file(file):
+
+    extension = Path(file.name).suffix.lower()
+
+    if extension == ".pdf":
+
+        return read_pdf(file)
+
+    elif extension == ".docx":
+
+        return read_docx(file)
+
+    elif extension in [".xlsx", ".xlsm", ".xltx"]:
+
+        return read_excel(file)
+
+    elif extension in [".txt", ".csv", ".md"]:
+
+        return read_text_file(file)
+
+    else:
+
+        return read_text_file(file)
+
+
 # ============================================================
-# CHUNK TEXT
+# LIMPIEZA DEL TEXTO
 # ============================================================
 
-def chunk_text(
+def clean_text(text: str):
+
+    if not text:
+        return ""
+
+    text = text.replace("\x00", " ")
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# CHUNKING
+# ============================================================
+
+def create_chunks(
     text: str,
     chunk_size: int,
     chunk_overlap: int
-) -> List[str]:
+):
 
-    chunks = []
+    text = clean_text(text)
 
     if not text:
-
-        return chunks
+        return []
 
     if chunk_overlap >= chunk_size:
 
-        chunk_overlap = chunk_size // 5
+        chunk_overlap = int(
+            chunk_size * 0.15
+        )
+
+    chunks = []
 
     start = 0
+    text_length = len(text)
 
-    step = chunk_size - chunk_overlap
+    while start < text_length:
 
-    while start < len(text):
-
-        end = start + chunk_size
+        end = min(
+            start + chunk_size,
+            text_length
+        )
 
         chunk = text[start:end].strip()
 
         if chunk:
-
             chunks.append(chunk)
 
-        start += step
+        if end >= text_length:
+            break
+
+        start = end - chunk_overlap
 
     return chunks
 
 
 # ============================================================
-# SUMMARIZE DOCUMENT
-# ============================================================
-
-def summarize_document(
-    ollama_url: str,
-    model: str,
-    text: str
-) -> str:
-
-    prompt = f"""
-Please provide a concise summary of the following document.
-
-DOCUMENT:
-
-{text}
-
-SUMMARY:
-"""
-
-    response = chat_with_documents(
-        ollama_url,
-        model,
-        prompt,
-        0.1
-    )
-
-    if not response:
-
-        return "Failed to generate summary."
-
-
-    summary = ""
-
-    try:
-
-        for line in response.iter_lines():
-
-            if line:
-
-                try:
-
-                    json_response = json.loads(
-                        line
-                    )
-
-                    if "response" in json_response:
-
-                        summary += json_response["response"]
-
-                except json.JSONDecodeError:
-
-                    continue
-
-    except Exception:
-
-        return "Failed to generate summary."
-
-    return summary.strip()
-
-
-# ============================================================
-# CHAT HISTORY
-# ============================================================
-
-def get_chat_history(
-    messages: List[Dict[str, str]],
-    memory_size: int
-) -> str:
-
-    history = messages[-memory_size * 2:]
-
-    formatted_history = []
-
-    for msg in history:
-
-        role = (
-            "Human"
-            if msg["role"] == "user"
-            else "AI"
-        )
-
-        formatted_history.append(
-            f"{role}: {msg['content']}"
-        )
-
-    return "\n".join(
-        formatted_history
-    )
-
-
-# ============================================================
-# KEYWORD SEARCH
-# ============================================================
-
-def keyword_search(
-    query: str,
-    documents: List[Dict]
-):
-
-    query_words = set(
-        query.lower().split()
-    )
-
-    scores = {}
-
-    for i, doc in enumerate(documents):
-
-        doc_words = set(
-            doc["content"].lower().split()
-        )
-
-        score = (
-            len(query_words.intersection(doc_words))
-            / len(query_words)
-            if query_words
-            else 0
-        )
-
-        scores[str(i)] = score
-
-    return scores
-
-
-# ============================================================
-# HYBRID SEARCH
-# ============================================================
-
-def hybrid_search(
-    query: str,
-    collection,
-    documents: List[Dict],
-    num_chunks: int
-):
-
-    if not documents:
-
-        return []
-
-
-    # ----------------------------------------
-    # Query embedding
-    # ----------------------------------------
-
-    question_embedding = embed_documents(
-        st.session_state.ollama_url,
-        st.session_state.embedding_model,
-        [query]
-    )
-
-    if not question_embedding:
-
-        return []
-
-
-    # ----------------------------------------
-    # Semantic search
-    # ----------------------------------------
-
-    total_docs = len(documents)
-
-    semantic_results = collection.query(
-        query_embeddings=question_embedding,
-        n_results=total_docs
-    )
-
-
-    semantic_similarities = {}
-
-
-    ids = semantic_results.get("ids", [[]])[0]
-
-    distances = semantic_results.get(
-        "distances",
-        [[]]
-    )[0]
-
-
-    for doc_id, distance in zip(
-        ids,
-        distances
-    ):
-
-        similarity = 1 / (1 + distance)
-
-        semantic_similarities[
-            str(doc_id)
-        ] = similarity
-
-
-    # ----------------------------------------
-    # Keyword search
-    # ----------------------------------------
-
-    keyword_scores = keyword_search(
-        query,
-        documents
-    )
-
-
-    # ----------------------------------------
-    # Normalize semantic scores
-    # ----------------------------------------
-
-    semantic_values = list(
-        semantic_similarities.values()
-    )
-
-    if semantic_values:
-
-        max_semantic = max(
-            semantic_values
-        )
-
-        min_semantic = min(
-            semantic_values
-        )
-
-        for doc_id in semantic_similarities:
-
-            if max_semantic != min_semantic:
-
-                semantic_similarities[
-                    doc_id
-                ] = (
-                    semantic_similarities[doc_id]
-                    - min_semantic
-                ) / (
-                    max_semantic
-                    - min_semantic
-                )
-
-            else:
-
-                semantic_similarities[
-                    doc_id
-                ] = 0
-
-
-    # ----------------------------------------
-    # Normalize keyword scores
-    # ----------------------------------------
-
-    keyword_values = list(
-        keyword_scores.values()
-    )
-
-    if keyword_values:
-
-        max_keyword = max(
-            keyword_values
-        )
-
-        min_keyword = min(
-            keyword_values
-        )
-
-        for doc_id in keyword_scores:
-
-            if max_keyword != min_keyword:
-
-                keyword_scores[
-                    doc_id
-                ] = (
-                    keyword_scores[doc_id]
-                    - min_keyword
-                ) / (
-                    max_keyword
-                    - min_keyword
-                )
-
-            else:
-
-                keyword_scores[
-                    doc_id
-                ] = 0
-
-
-    # ----------------------------------------
-    # Combine scores
-    # ----------------------------------------
-
-    combined_scores = {}
-
-    for doc_id in semantic_similarities:
-
-        combined_scores[doc_id] = (
-            semantic_similarities[doc_id]
-            +
-            keyword_scores.get(
-                doc_id,
-                0
-            )
-        ) / 2
-
-
-    # ----------------------------------------
-    # Sort
-    # ----------------------------------------
-
-    sorted_docs = sorted(
-        combined_scores.items(),
-        key=lambda item: item[1],
-        reverse=True
-    )
-
-
-    # ----------------------------------------
-    # Top chunks
-    # ----------------------------------------
-
-    top_docs = []
-
-    for doc_id, score in sorted_docs[:num_chunks]:
-
-        index = int(doc_id)
-
-        if index >= len(documents):
-
-            continue
-
-        doc = documents[index]
-
-        top_docs.append(
-            (
-                doc["content"],
-                doc["metadata"],
-                score
-            )
-        )
-
-    return top_docs
-
-
-# ============================================================
-# COLLECTION NAME
-# ============================================================
-
-def sanitize_collection_name(
-    name: str
-) -> str:
-
-    sanitized = re.sub(
-        r"[^\w-]",
-        "_",
-        name
-    )
-
-    sanitized = re.sub(
-        r"^[^a-zA-Z0-9]+",
-        "",
-        sanitized
-    )
-
-    sanitized = re.sub(
-        r"[^a-zA-Z0-9]+$",
-        "",
-        sanitized
-    )
-
-    sanitized = sanitized[:63]
-
-    while len(sanitized) < 3:
-
-        sanitized += "_"
-
-    return sanitized
-
-
-# ============================================================
-# FILE HASH
+# HASH DE ARCHIVOS
 # ============================================================
 
 def get_file_hash(file):
 
     file.seek(0)
 
-    data = file.read()
+    content = file.read()
 
     file.seek(0)
 
-    return hashlib.md5(
-        data
-    ).hexdigest()
+    return hashlib.md5(content).hexdigest()
 
 
 # ============================================================
-# MAIN
+# RESUMEN DE DOCUMENTOS
 # ============================================================
 
-def main():
+def summarize_document(
+    model: str,
+    text: str
+):
 
-    # ----------------------------------------
-    # SESSION STATE
-    # ----------------------------------------
+    if not text:
+        return ""
 
-    if "ollama_url" not in st.session_state:
+    # Evita enviar documentos enormes
+    text_for_summary = text[:MAX_SUMMARY_CHARS]
 
-        st.session_state.ollama_url = (
-            get_ollama_url()
+    prompt = f"""
+Eres un asistente especializado en análisis documental.
+
+Resume el siguiente documento de forma concisa.
+
+Incluye:
+- Tema principal
+- Información importante
+- Datos relevantes
+- Procesos
+- Fechas
+- Personas o áreas involucradas
+- Conclusiones importantes
+
+No inventes información.
+
+DOCUMENTO:
+
+{text_for_summary}
+"""
+
+    response = ollama_chat(
+        model=model,
+        prompt=prompt,
+        temperature=0.0,
+        stream=False
+    )
+
+    if response is None:
+        return ""
+
+    try:
+
+        data = response.json()
+
+        message = data.get(
+            "message",
+            {}
         )
 
-    if "models" not in st.session_state:
+        return message.get(
+            "content",
+            ""
+        ).strip()
 
-        st.session_state.models = []
+    except Exception:
 
-    if "connection_status" not in st.session_state:
+        return ""
 
-        st.session_state.connection_status = False
 
-    if "messages" not in st.session_state:
+# ============================================================
+# KEYWORD SEARCH
+# ============================================================
+
+def tokenize(text):
+
+    return set(
+        re.findall(
+            r"\b\w+\b",
+            text.lower()
+        )
+    )
+
+
+def keyword_score(
+    query: str,
+    document: str
+):
+
+    query_words = tokenize(query)
+    document_words = tokenize(document)
+
+    if not query_words:
+        return 0.0
+
+    intersection = (
+        query_words & document_words
+    )
+
+    return len(intersection) / len(
+        query_words
+    )
+
+
+# ============================================================
+# NORMALIZACIÓN
+# ============================================================
+
+def normalize_scores(scores):
+
+    if not scores:
+        return []
+
+    minimum = min(scores)
+    maximum = max(scores)
+
+    if maximum == minimum:
+
+        return [
+            1.0 if maximum > 0 else 0.0
+            for _ in scores
+        ]
+
+    return [
+        (score - minimum) /
+        (maximum - minimum)
+        for score in scores
+    ]
+
+
+# ============================================================
+# CHROMADB
+# ============================================================
+
+def create_vector_collection():
+
+    client = chromadb.Client()
+
+    collection_name = (
+        "simplerag_collection"
+    )
+
+    # Si existe, eliminarla
+    try:
+
+        client.delete_collection(
+            collection_name
+        )
+
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name=collection_name
+    )
+
+    return collection
+
+
+# ============================================================
+# PROCESAMIENTO RAG
+# ============================================================
+
+def process_documents(
+    uploaded_files,
+    embedding_model,
+    chat_model,
+    chunk_size,
+    chunk_overlap
+):
+
+    collection = create_vector_collection()
+
+    all_chunks = []
+    all_metadata = []
+    all_ids = []
+
+    summaries = {}
+    documents_info = []
+
+    progress = st.progress(0)
+
+    total_files = len(
+        uploaded_files
+    )
+
+    for file_index, file in enumerate(
+        uploaded_files
+    ):
+
+        # ----------------------------------------
+        # Tamaño
+        # ----------------------------------------
+
+        file.seek(0)
+
+        file_bytes = file.read()
+
+        file.seek(0)
+
+        file_size_mb = (
+            len(file_bytes) /
+            1024 /
+            1024
+        )
+
+        if file_size_mb > MAX_FILE_SIZE_MB:
+
+            st.warning(
+                f"{file.name} supera "
+                f"{MAX_FILE_SIZE_MB} MB y fue omitido."
+            )
+
+            continue
+
+        # ----------------------------------------
+        # Hash
+        # ----------------------------------------
+
+        file_hash = get_file_hash(
+            file
+        )
+
+        # ----------------------------------------
+        # Lectura
+        # ----------------------------------------
+
+        with st.spinner(
+            f"Leyendo {file.name}..."
+        ):
+
+            text = read_uploaded_file(
+                file
+            )
+
+        text = clean_text(text)
+
+        if not text:
+
+            st.warning(
+                f"No se encontró texto en {file.name}."
+            )
+
+            continue
+
+        # ----------------------------------------
+        # Resumen
+        # ----------------------------------------
+
+        with st.spinner(
+            f"Generando resumen de {file.name}..."
+        ):
+
+            summary = summarize_document(
+                chat_model,
+                text
+            )
+
+        summaries[file.name] = summary
+
+        # ----------------------------------------
+        # Chunks
+        # ----------------------------------------
+
+        chunks = create_chunks(
+            text,
+            chunk_size,
+            chunk_overlap
+        )
+
+        documents_info.append({
+            "name": file.name,
+            "hash": file_hash,
+            "characters": len(text),
+            "chunks": len(chunks)
+        })
+
+        # ----------------------------------------
+        # Guardar chunks
+        # ----------------------------------------
+
+        for chunk_index, chunk in enumerate(
+            chunks
+        ):
+
+            chunk_id = (
+                f"{file_hash}_"
+                f"{chunk_index}"
+            )
+
+            all_chunks.append(chunk)
+
+            all_metadata.append({
+                "source": file.name,
+                "chunk": chunk_index
+            })
+
+            all_ids.append(
+                chunk_id
+            )
+
+        progress.progress(
+            (file_index + 1) /
+            total_files
+        )
+
+    progress.empty()
+
+    if not all_chunks:
+
+        st.error(
+            "No se pudieron procesar documentos."
+        )
+
+        return None, {}, []
+
+    # ========================================================
+    # EMBEDDINGS
+    # ========================================================
+
+    st.info(
+        f"Generando embeddings para "
+        f"{len(all_chunks)} chunks..."
+    )
+
+    # Una sola llamada por bloques.
+    # Esto evita cientos de requests individuales.
+
+    embeddings = []
+
+    batch_size = 32
+
+    embedding_progress = st.progress(0)
+
+    total_batches = (
+        len(all_chunks) +
+        batch_size - 1
+    ) // batch_size
+
+    for batch_number, start in enumerate(
+        range(
+            0,
+            len(all_chunks),
+            batch_size
+        )
+    ):
+
+        batch = all_chunks[
+            start:start + batch_size
+        ]
+
+        batch_embeddings = embed_texts(
+            embedding_model,
+            batch
+        )
+
+        if not batch_embeddings:
+
+            st.error(
+                "No se pudieron generar los embeddings."
+            )
+
+            return None, {}, []
+
+        embeddings.extend(
+            batch_embeddings
+        )
+
+        embedding_progress.progress(
+            (batch_number + 1) /
+            total_batches
+        )
+
+    embedding_progress.empty()
+
+    # ========================================================
+    # CHROMA
+    # ========================================================
+
+    collection.add(
+        ids=all_ids,
+        embeddings=embeddings,
+        documents=all_chunks,
+        metadatas=all_metadata
+    )
+
+    return (
+        collection,
+        summaries,
+        documents_info
+    )
+
+
+# ============================================================
+# BÚSQUEDA HÍBRIDA
+# ============================================================
+
+def hybrid_search(
+    collection,
+    query,
+    embedding_model,
+    num_chunks
+):
+
+    if collection is None:
+
+        return []
+
+    # ----------------------------------------
+    # Query embedding
+    # ----------------------------------------
+
+    query_embedding = embed_text(
+        embedding_model,
+        query
+    )
+
+    if not query_embedding:
+
+        return []
+
+    # ----------------------------------------
+    # Solicitar solamente candidatos razonables
+    # ----------------------------------------
+
+    collection_count = (
+        collection.count()
+    )
+
+    candidate_count = min(
+        max(num_chunks * 4, 10),
+        collection_count
+    )
+
+    results = collection.query(
+        query_embeddings=[
+            query_embedding
+        ],
+        n_results=candidate_count,
+        include=[
+            "documents",
+            "metadatas",
+            "distances"
+        ]
+    )
+
+    documents = (
+        results.get("documents", [[]])[0]
+    )
+
+    metadatas = (
+        results.get("metadatas", [[]])[0]
+    )
+
+    distances = (
+        results.get("distances", [[]])[0]
+    )
+
+    if not documents:
+
+        return []
+
+    # ----------------------------------------
+    # Semantic score
+    # ----------------------------------------
+
+    semantic_scores = [
+        1 / (1 + distance)
+        for distance in distances
+    ]
+
+    # ----------------------------------------
+    # Keyword score
+    # ----------------------------------------
+
+    keyword_scores = [
+        keyword_score(
+            query,
+            document
+        )
+        for document in documents
+    ]
+
+    semantic_normalized = normalize_scores(
+        semantic_scores
+    )
+
+    keyword_normalized = normalize_scores(
+        keyword_scores
+    )
+
+    # ----------------------------------------
+    # Hybrid score
+    # ----------------------------------------
+
+    combined = []
+
+    for i in range(
+        len(documents)
+    ):
+
+        score = (
+            0.70 *
+            semantic_normalized[i]
+            +
+            0.30 *
+            keyword_normalized[i]
+        )
+
+        combined.append({
+            "document": documents[i],
+            "metadata": metadatas[i],
+            "semantic_score": semantic_normalized[i],
+            "keyword_score": keyword_normalized[i],
+            "score": score
+        })
+
+    combined.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return combined[
+        :num_chunks
+    ]
+
+
+# ============================================================
+# PROMPT RAG
+# ============================================================
+
+def build_rag_prompt(
+    question,
+    retrieved_chunks,
+    summaries,
+    chat_history,
+    prompt_template
+):
+
+    context_parts = []
+
+    for index, item in enumerate(
+        retrieved_chunks,
+        start=1
+    ):
+
+        source = item[
+            "metadata"
+        ].get(
+            "source",
+            "Documento"
+        )
+
+        context_parts.append(
+            f"""
+--- FUENTE {index}: {source} ---
+
+{item["document"]}
+"""
+        )
+
+    context = "\n".join(
+        context_parts
+    )
+
+    summary_text = ""
+
+    for filename, summary in summaries.items():
+
+        if summary:
+
+            summary_text += (
+                f"\n--- {filename} ---\n"
+                f"{summary}\n"
+            )
+
+    history_text = ""
+
+    for message in chat_history[-6:]:
+
+        role = message.get(
+            "role",
+            ""
+        )
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        history_text += (
+            f"{role.upper()}: "
+            f"{content}\n"
+        )
+
+    if not prompt_template.strip():
+
+        prompt_template = """
+Responde la pregunta utilizando exclusivamente
+la información encontrada en los documentos.
+
+Si la información no está disponible,
+indica claramente que no se encuentra en
+los documentos proporcionados.
+
+No inventes datos.
+
+Responde en español de manera clara,
+profesional y concisa.
+"""
+
+    prompt = f"""
+{prompt_template}
+
+========================
+CONTEXTO RECUPERADO
+========================
+
+{context}
+
+========================
+RESÚMENES
+========================
+
+{summary_text}
+
+========================
+HISTORIAL
+========================
+
+{history_text}
+
+========================
+PREGUNTA
+========================
+
+{question}
+
+========================
+RESPUESTA
+========================
+"""
+
+    return prompt
+
+
+# ============================================================
+# PARSE STREAM
+# ============================================================
+
+def stream_ollama_response(
+    response
+):
+
+    for line in response.iter_lines():
+
+        if not line:
+            continue
+
+        try:
+
+            decoded = line.decode(
+                "utf-8"
+            )
+
+            data = json.loads(
+                decoded
+            )
+
+            message = data.get(
+                "message",
+                {}
+            )
+
+            content = message.get(
+                "content",
+                ""
+            )
+
+            if content:
+                yield content
+
+        except Exception:
+
+            continue
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+def initialize_session_state():
+
+    defaults = {
+
+        "messages": [],
+
+        "collection": None,
+
+        "summaries": {},
+
+        "documents_info": [],
+
+        "data_processed": False,
+
+        "embedding_model":
+            DEFAULT_EMBEDDING_MODEL,
+
+        "chat_model":
+            DEFAULT_CHAT_MODEL,
+
+    }
+
+    for key, value in defaults.items():
+
+        if key not in st.session_state:
+
+            st.session_state[
+                key
+            ] = value
+
+
+initialize_session_state()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("⚙️ Configuración")
+
+    # --------------------------------------------------------
+    # API
+    # --------------------------------------------------------
+
+    st.subheader(
+        "☁️ Ollama Cloud"
+    )
+
+    key_ok, key_message = (
+        validate_ollama_key()
+    )
+
+    if key_ok:
+
+        st.success(
+            "OLLAMA_API_KEY detectada"
+        )
+
+    else:
+
+        st.error(
+            key_message
+        )
+
+    st.caption(
+        "La aplicación utiliza Ollama Cloud. "
+        "No necesita Ollama instalado en tu PC."
+    )
+
+    # --------------------------------------------------------
+    # MODELOS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "🤖 Modelos"
+    )
+
+    chat_model = st.text_input(
+        "Modelo de Chat",
+        value=st.session_state.chat_model,
+        help=(
+            "Modelo utilizado para responder "
+            "las preguntas y crear resúmenes."
+        )
+    )
+
+    embedding_model = st.text_input(
+        "Modelo de Embeddings",
+        value=st.session_state.embedding_model,
+        help=(
+            "Modelo utilizado para convertir "
+            "los documentos en vectores."
+        )
+    )
+
+    st.session_state.chat_model = (
+        chat_model
+    )
+
+    st.session_state.embedding_model = (
+        embedding_model
+    )
+
+    # --------------------------------------------------------
+    # RAG
+    # --------------------------------------------------------
+
+    st.subheader(
+        "📚 Configuración RAG"
+    )
+
+    chunk_size = st.slider(
+        "Tamaño del chunk",
+        min_value=500,
+        max_value=2000,
+        value=DEFAULT_CHUNK_SIZE,
+        step=100
+    )
+
+    chunk_overlap = st.slider(
+        "Overlap",
+        min_value=50,
+        max_value=400,
+        value=DEFAULT_CHUNK_OVERLAP,
+        step=50
+    )
+
+    num_chunks = st.slider(
+        "Chunks recuperados",
+        min_value=2,
+        max_value=10,
+        value=DEFAULT_NUM_CHUNKS
+    )
+
+    temperature = st.slider(
+        "Temperature",
+        min_value=0.0,
+        max_value=1.0,
+        value=DEFAULT_TEMPERATURE,
+        step=0.05
+    )
+
+    memory_size = st.slider(
+        "Memoria de conversación",
+        min_value=1,
+        max_value=10,
+        value=DEFAULT_MEMORY_SIZE
+    )
+
+    # --------------------------------------------------------
+    # PROMPT
+    # --------------------------------------------------------
+
+    st.subheader(
+        "📝 Prompt"
+    )
+
+    prompt_template = st.text_area(
+        "Instrucciones del asistente",
+        value="""
+Responde la pregunta utilizando exclusivamente
+la información encontrada en los documentos.
+
+Si la información no está disponible,
+indica claramente que no se encuentra en
+los documentos proporcionados.
+
+No inventes datos.
+
+Responde en español de manera clara,
+profesional y concisa.
+""",
+        height=180
+    )
+
+    # --------------------------------------------------------
+    # ARCHIVOS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "📂 Documentos"
+    )
+
+    uploaded_files = st.file_uploader(
+        "Sube tus documentos",
+        type=[
+            "pdf",
+            "docx",
+            "xlsx",
+            "xlsm",
+            "txt",
+            "csv",
+            "md"
+        ],
+        accept_multiple_files=True
+    )
+
+    process_button = st.button(
+        "🚀 Procesar documentos",
+        type="primary",
+        use_container_width=True
+    )
+
+    if st.button(
+        "🗑️ Limpiar conversación",
+        use_container_width=True
+    ):
 
         st.session_state.messages = []
 
-    if "collection" not in st.session_state:
+        st.rerun()
 
-        st.session_state.collection = None
 
-    if "data_processed" not in st.session_state:
+# ============================================================
+# PROCESAR DOCUMENTOS
+# ============================================================
 
-        st.session_state.data_processed = False
+if process_button:
 
-    if "documents" not in st.session_state:
+    if not key_ok:
 
-        st.session_state.documents = []
+        st.error(
+            "Primero configura OLLAMA_API_KEY "
+            "en Streamlit Secrets."
+        )
 
-    if "summaries" not in st.session_state:
+        st.stop()
 
-        st.session_state.summaries = {}
+    if not uploaded_files:
 
-    if "processed_file_hashes" not in st.session_state:
+        st.warning(
+            "Sube al menos un documento."
+        )
 
-        st.session_state.processed_file_hashes = {}
+        st.stop()
 
-    if "embedding_model" not in st.session_state:
+    with st.spinner(
+        "Procesando documentos..."
+    ):
 
-        st.session_state.embedding_model = ""
+        (
+            collection,
+            summaries,
+            documents_info
+        ) = process_documents(
+            uploaded_files=uploaded_files,
+            embedding_model=embedding_model,
+            chat_model=chat_model,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
 
-    if "chat_model" not in st.session_state:
+    if collection is not None:
 
-        st.session_state.chat_model = ""
+        st.session_state.collection = (
+            collection
+        )
 
-    # ----------------------------------------
-    # SIDEBAR
-    # ----------------------------------------
+        st.session_state.summaries = (
+            summaries
+        )
 
-    with st.sidebar:
+        st.session_state.documents_info = (
+            documents_info
+        )
 
-        st.title("💬 SimpleRAG")
+        st.session_state.data_processed = (
+            True
+        )
 
-        st.header("Settings")
-
-
-        # ------------------------------------
-        # MODEL SETTINGS
-        # ------------------------------------
-
-        with st.expander(
-            "🤖 Model Settings",
-            expanded=True
-        ):
-
-            ollama_url_input = st.text_input(
-                "Ollama Server URL:",
-                value=st.session_state.ollama_url,
-                help=(
-                    "Example: https://your-ollama-server.com"
-                )
-            )
-
-            if ollama_url_input:
-
-                ollama_url_input = (
-                    ollama_url_input.rstrip("/")
-                )
-
-            if (
-                ollama_url_input
-                != st.session_state.ollama_url
-            ):
-
-                st.session_state.ollama_url = (
-                    ollama_url_input
-                )
-
-                st.session_state.connection_status = False
-
-                st.cache_data.clear()
-
-
-            # --------------------------------
-            # TEST CONNECTION
-            # --------------------------------
-
-            if not st.session_state.connection_status:
-
-                if check_ollama_connection(
-                    st.session_state.ollama_url
-                ):
-
-                    st.session_state.connection_status = True
-
-                    st.session_state.models = (
-                        get_ollama_models(
-                            st.session_state.ollama_url
-                        )
-                    )
-
-                else:
-
-                    st.session_state.connection_status = False
-
-
-            if not st.session_state.connection_status:
-
-                st.error(
-                    "❌ Cannot connect to Ollama."
-                )
-
-                st.info(
-                    "Check the Ollama URL and make sure the server is accessible from the Internet."
-                )
-
-
-            elif not st.session_state.models:
-
-                st.error(
-                    "No Ollama models available."
-                )
-
-
-            else:
-
-                st.success(
-                    "✅ Ollama connected"
-                )
-
-
-                # ----------------------------
-                # EMBEDDING MODEL
-                # ----------------------------
-
-                selected_embedding_model = st.selectbox(
-                    "Select the embedding model",
-                    st.session_state.models,
-                    key="embedding_model_select"
-                )
-
-
-                if (
-                    st.session_state.embedding_model
-                    != selected_embedding_model
-                ):
-
-                    st.session_state.embedding_model = (
-                        selected_embedding_model
-                    )
-
-                    st.session_state.data_processed = False
-
-                    st.session_state.collection = None
-
-                    st.session_state.documents = []
-
-                    st.session_state.summaries = {}
-
-                    st.session_state.processed_file_hashes = {}
-
-                    st.warning(
-                        "Embedding model changed. Please reprocess your documents."
-                    )
-
-
-                # ----------------------------
-                # CHAT MODEL
-                # ----------------------------
-
-                selected_chat_model = st.selectbox(
-                    "Select the chat model",
-                    st.session_state.models,
-                    key="chat_model_select"
-                )
-
-
-                st.session_state.chat_model = (
-                    selected_chat_model
-                )
-
-
-                # ----------------------------
-                # TEMPERATURE
-                # ----------------------------
-
-                temperature = st.slider(
-                    "Temperature",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=DEFAULT_TEMPERATURE,
-                    step=0.1
-                )
-
-
-        # ------------------------------------
-        # PROCESS SETTINGS
-        # ------------------------------------
-
-        with st.expander(
-            "📄 Process Settings"
-        ):
-
-            chunk_size = st.number_input(
-                "Chunk size",
-                min_value=100,
-                max_value=2000,
-                value=DEFAULT_CHUNK_SIZE
-            )
-
-            chunk_overlap = st.number_input(
-                "Chunk overlap",
-                min_value=0,
-                max_value=500,
-                value=DEFAULT_CHUNK_OVERLAP
-            )
-
-            num_chunks = st.number_input(
-                "Number of chunks to retrieve",
-                min_value=1,
-                max_value=10,
-                value=DEFAULT_NUM_CHUNKS
-            )
-
-
-        # ------------------------------------
-        # CHAT SETTINGS
-        # ------------------------------------
-
-        with st.expander(
-            "💬 Chat Settings"
-        ):
-
-            memory_size = st.number_input(
-                "Number of messages to keep in memory",
-                min_value=1,
-                max_value=10,
-                value=DEFAULT_MEMORY_SIZE
-            )
-
-            prompt_template = st.text_area(
-                "Prompt template",
-                value=DEFAULT_PROMPT_TEMPLATE
-            )
-
-
-        # ------------------------------------
-        # FILE UPLOAD
-        # ------------------------------------
-
-        uploaded_files = st.file_uploader(
-            "Choose files",
-            type=[
-                "pdf",
-                "docx",
-                "xlsx",
-                "txt",
-                "csv"
-            ],
-            accept_multiple_files=True
+        st.success(
+            "✅ Documentos procesados correctamente."
         )
 
 
-        process_button = st.button(
-            "🔄 Process Documents",
-            use_container_width=True
+# ============================================================
+# TÍTULO PRINCIPAL
+# ============================================================
+
+st.title(
+    "💬 SimpleRAG"
+)
+
+st.caption(
+    "RAG documental con Streamlit + Ollama Cloud + ChromaDB"
+)
+
+
+# ============================================================
+# ESTADO DEL SISTEMA
+# ============================================================
+
+if st.session_state.data_processed:
+
+    total_chunks = (
+        st.session_state.collection.count()
+        if st.session_state.collection
+        else 0
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        st.metric(
+            "Documentos",
+            len(
+                st.session_state.documents_info
+            )
+        )
+
+    with col2:
+
+        st.metric(
+            "Chunks",
+            total_chunks
+        )
+
+    with col3:
+
+        st.metric(
+            "Modelo",
+            chat_model
         )
 
 
-        # ------------------------------------
-        # CLEAR CHAT
-        # ------------------------------------
+# ============================================================
+# DOCUMENTOS PROCESADOS
+# ============================================================
 
-        if st.button(
-            "🧹 Clear Chat",
-            use_container_width=True
+if st.session_state.documents_info:
+
+    with st.expander(
+        "📚 Ver documentos procesados"
+    ):
+
+        for document in (
+            st.session_state.documents_info
         ):
 
-            st.session_state.messages = []
+            st.write(
+                f"**{document['name']}**"
+            )
 
-            st.rerun()
+            st.caption(
+                f"Caracteres: "
+                f"{document['characters']:,} | "
+                f"Chunks: "
+                f"{document['chunks']}"
+            )
 
 
-        # ------------------------------------
-        # PROCESS DOCUMENTS
-        # ------------------------------------
+# ============================================================
+# CHAT
+# ============================================================
 
-        if process_button:
+if not st.session_state.data_processed:
 
-            if not uploaded_files:
+    st.info(
+        "👈 Sube uno o varios documentos "
+        "desde el panel lateral y presiona "
+        "**Procesar documentos**."
+    )
 
-                st.warning(
-                    "Please upload at least one document."
-                )
+else:
 
-            elif not st.session_state.connection_status:
+    st.subheader(
+        "💬 Pregunta sobre tus documentos"
+    )
 
-                st.error(
-                    "Connect to Ollama before processing documents."
-                )
-
-            elif not st.session_state.embedding_model:
-
-                st.error(
-                    "Select an embedding model."
-                )
-
-            else:
-
-                with st.spinner(
-                    "Processing documents..."
-                ):
-
-                    start_time = time.time()
-
-                    progress_bar = st.progress(0)
-
-                    status_text = st.empty()
-
-                    documents = []
-
-                    summaries = {}
-
-
-                    # ----------------------------
-                    # READ FILES
-                    # ----------------------------
-
-                    for idx, file in enumerate(
-                        uploaded_files
-                    ):
-
-                        status_text.text(
-                            f"Reading {file.name}..."
-                        )
-
-                        file_hash = get_file_hash(
-                            file
-                        )
-
-
-                        if (
-                            file_hash
-                            in st.session_state.processed_file_hashes
-                        ):
-
-                            cached = (
-                                st.session_state
-                                .processed_file_hashes[
-                                    file_hash
-                                ]
-                            )
-
-                            content = cached["content"]
-
-                            summary = cached["summary"]
-
-
-                        else:
-
-                            content = read_file(
-                                file,
-                                file.name
-                            )
-
-
-                            if content:
-
-                                summary = summarize_document(
-                                    st.session_state.ollama_url,
-                                    st.session_state.chat_model,
-                                    content
-                                )
-
-                            else:
-
-                                summary = ""
-
-
-                            st.session_state.processed_file_hashes[
-                                file_hash
-                            ] = {
-                                "content": content,
-                                "summary": summary
-                            }
-
-
-                        if not content:
-
-                            continue
-
-
-                        summaries[file.name] = summary
-
-
-                        chunks = chunk_text(
-                            content,
-                            int(chunk_size),
-                            int(chunk_overlap)
-                        )
-
-
-                        for i, chunk in enumerate(chunks):
-
-                            documents.append(
-                                {
-                                    "content": chunk,
-                                    "metadata": {
-                                        "source": file.name,
-                                        "chunk": i,
-                                        "summary": summary
-                                    }
-                                }
-                            )
-
-
-                        progress = int(
-                            ((idx + 1)
-                            / len(uploaded_files))
-                            * 30
-                        )
-
-                        progress_bar.progress(
-                            progress
-                        )
-
-
-                    if not documents:
-
-                        st.error(
-                            "No readable content was found."
-                        )
-
-                        return
-
-
-                    # ----------------------------
-                    # EMBEDDINGS
-                    # ----------------------------
-
-                    status_text.text(
-                        "Generating embeddings..."
-                    )
-
-
-                    embeddings = embed_documents(
-                        st.session_state.ollama_url,
-                        st.session_state.embedding_model,
-                        [
-                            doc["content"]
-                            for doc in documents
-                        ]
-                    )
-
-
-                    progress_bar.progress(65)
-
-
-                    if not embeddings:
-
-                        st.error(
-                            "Failed to generate embeddings."
-                        )
-
-                        return
-
-
-                    # ----------------------------
-                    # CHROMADB
-                    # ----------------------------
-
-                    status_text.text(
-                        "Initializing ChromaDB..."
-                    )
-
-
-                    try:
-
-                        chroma_client = (
-                            chromadb.Client()
-                        )
-
-                        progress_bar.progress(75)
-
-
-                        base_name = (
-                            "document_collection_"
-                            +
-                            st.session_state.embedding_model
-                        )
-
-
-                        collection_name = (
-                            sanitize_collection_name(
-                                base_name
-                            )
-                        )
-
-
-                        # Delete old collection
-
-                        try:
-
-                            chroma_client.delete_collection(
-                                name=collection_name
-                            )
-
-                        except Exception:
-
-                            pass
-
-
-                        # Create collection
-
-                        collection = (
-                            chroma_client.create_collection(
-                                name=collection_name
-                            )
-                        )
-
-
-                        # Add vectors
-
-                        status_text.text(
-                            "Indexing documents..."
-                        )
-
-
-                        collection.add(
-                            embeddings=embeddings,
-                            documents=[
-                                doc["content"]
-                                for doc in documents
-                            ],
-                            metadatas=[
-                                doc["metadata"]
-                                for doc in documents
-                            ],
-                            ids=[
-                                str(i)
-                                for i in range(
-                                    len(documents)
-                                )
-                            ]
-                        )
-
-
-                        progress_bar.progress(100)
-
-
-                        # Save state
-
-                        st.session_state.collection = (
-                            collection
-                        )
-
-                        st.session_state.documents = (
-                            documents
-                        )
-
-                        st.session_state.summaries = (
-                            summaries
-                        )
-
-                        st.session_state.data_processed = (
-                            True
-                        )
-
-
-                        processing_time = (
-                            time.time()
-                            - start_time
-                        )
-
-
-                        status_text.success(
-                            f"Processing complete in {processing_time:.2f} seconds."
-                        )
-
-
-                        st.success(
-                            f"✅ {len(documents)} chunks indexed."
-                        )
-
-
-                    except Exception as e:
-
-                        st.error(
-                            f"ChromaDB error: {str(e)}"
-                        )
-
-                        st.session_state.data_processed = False
-
-
-    # ========================================================
-    # CHAT
-    # ========================================================
-
-    st.header("💬 Chat")
-
-
-    # ----------------------------------------
-    # DISPLAY HISTORY
-    # ----------------------------------------
-
-    for chat_message in (
+    # Mostrar historial
+    for message in (
         st.session_state.messages
     ):
 
         with st.chat_message(
-            chat_message["role"]
+            message["role"]
         ):
 
             st.markdown(
-                chat_message["content"]
+                message["content"]
             )
 
-
-    # ----------------------------------------
-    # CHAT INPUT
-    # ----------------------------------------
-
-    if not st.session_state.data_processed:
-
-        st.info(
-            "💡 Connect to Ollama, select models, upload documents and process them first."
-        )
-
-        return
-
-
-    prompt = st.chat_input(
-        "Ask a question about the documents"
+    question = st.chat_input(
+        "Escribe tu pregunta..."
     )
 
+    if question:
 
-    if prompt:
+        # --------------------------------------------
+        # Usuario
+        # --------------------------------------------
 
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": prompt
-            }
-        )
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
 
+        with st.chat_message(
+            "user"
+        ):
 
-        with st.chat_message("user"):
-
-            st.markdown(prompt)
-
-
-        with st.chat_message("assistant"):
-
-            with st.spinner("Searching documents..."):
-
-                results = hybrid_search(
-                    prompt,
-                    st.session_state.collection,
-                    st.session_state.documents,
-                    int(num_chunks)
-                )
-
-
-            if not results:
-
-                st.error(
-                    "No relevant documents found."
-                )
-
-                return
-
-
-            # ------------------------------------
-            # CONTEXT
-            # ------------------------------------
-
-            context = "\n\n".join(
-                [
-                    doc[0]
-                    for doc in results
-                ]
+            st.markdown(
+                question
             )
 
+        # --------------------------------------------
+        # Retrieval
+        # --------------------------------------------
 
-            summaries_text = "\n\n".join(
-                [
-                    f"{file}: {summary}"
-                    for file, summary
-                    in st.session_state.summaries.items()
-                ]
-            )
+        with st.spinner(
+            "🔎 Buscando información relevante..."
+        ):
 
-
-            chat_history = get_chat_history(
-                st.session_state.messages,
-                int(memory_size)
-            )
-
-
-            full_prompt = (
-                prompt_template.format(
-                    context=context,
-                    summaries=summaries_text,
-                    memory=chat_history,
-                    question=prompt
+            retrieved_chunks = (
+                hybrid_search(
+                    collection=(
+                        st.session_state.collection
+                    ),
+                    query=question,
+                    embedding_model=embedding_model,
+                    num_chunks=num_chunks
                 )
             )
 
+        if not retrieved_chunks:
 
-            # ------------------------------------
-            # GENERATE ANSWER
-            # ------------------------------------
-
-            response = chat_with_documents(
-                st.session_state.ollama_url,
-                st.session_state.chat_model,
-                full_prompt,
-                temperature
+            answer = (
+                "No encontré información "
+                "relevante en los documentos."
             )
 
-
-            if not response:
-
-                st.error(
-                    "Failed to generate response."
-                )
-
-                return
-
-
-            full_response = ""
-
-            message_placeholder = st.empty()
-
-
-            try:
-
-                for line in response.iter_lines():
-
-                    if not line:
-
-                        continue
-
-
-                    try:
-
-                        json_response = json.loads(
-                            line
-                        )
-
-
-                        if "response" in json_response:
-
-                            full_response += (
-                                json_response["response"]
-                            )
-
-
-                            message_placeholder.markdown(
-                                full_response + "▌"
-                            )
-
-
-                    except json.JSONDecodeError:
-
-                        continue
-
-
-            except Exception as e:
-
-                st.error(
-                    f"Error reading response: {str(e)}"
-                )
-
-
-            message_placeholder.markdown(
-                full_response
-            )
-
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": full_response
-                }
-            )
-
-
-            # ------------------------------------
-            # SOURCES
-            # ------------------------------------
-
-            with st.expander(
-                "📚 View Relevant Document Chunks"
+            with st.chat_message(
+                "assistant"
             ):
 
-                for i, (
-                    doc,
-                    metadata,
-                    score
-                ) in enumerate(results):
+                st.markdown(
+                    answer
+                )
 
-                    st.markdown(
-                        f"**Chunk {i + 1}**"
-                    )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer
+            })
 
-                    st.text(doc)
+            st.stop()
 
-                    st.write(
-                        f"Source: {metadata['source']}"
-                    )
+        # --------------------------------------------
+        # Prompt
+        # --------------------------------------------
 
-                    st.write(
-                        f"Chunk number: {metadata['chunk']}"
-                    )
+        prompt = build_rag_prompt(
+            question=question,
+            retrieved_chunks=retrieved_chunks,
+            summaries=(
+                st.session_state.summaries
+            ),
+            chat_history=(
+                st.session_state.messages[
+                    -(memory_size * 2):
+                ]
+            ),
+            prompt_template=prompt_template
+        )
 
-                    st.write(
-                        f"Relevance score: {score:.4f}"
-                    )
+        # --------------------------------------------
+        # Chat Cloud
+        # --------------------------------------------
 
-                    st.markdown("---")
+        with st.chat_message(
+            "assistant"
+        ):
+
+            response = ollama_chat(
+                model=chat_model,
+                prompt=prompt,
+                temperature=temperature,
+                stream=True
+            )
+
+            if response is None:
+
+                st.stop()
+
+            answer_placeholder = st.empty()
+
+            answer = ""
+
+            for token in stream_ollama_response(
+                response
+            ):
+
+                answer += token
+
+                answer_placeholder.markdown(
+                    answer
+                )
+
+        # --------------------------------------------
+        # Guardar respuesta
+        # --------------------------------------------
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        # --------------------------------------------
+        # Fuentes
+        # --------------------------------------------
+
+        with st.expander(
+            "🔎 Ver información recuperada"
+        ):
+
+            for index, item in enumerate(
+                retrieved_chunks,
+                start=1
+            ):
+
+                source = item[
+                    "metadata"
+                ].get(
+                    "source",
+                    "Documento"
+                )
+
+                score = item[
+                    "score"
+                ]
+
+                st.markdown(
+                    f"### {index}. {source}"
+                )
+
+                st.caption(
+                    f"Relevancia: "
+                    f"{score:.2%}"
+                )
+
+                st.write(
+                    item["document"]
+                )
+
+                st.divider()
 
 
 # ============================================================
-# RUN
+# FOOTER
 # ============================================================
 
-if __name__ == "__main__":
+st.divider()
 
-    main()
+st.caption(
+    "SimpleRAG • Streamlit Cloud • Ollama Cloud • ChromaDB"
+)
