@@ -3,9 +3,8 @@ import os
 import json
 import hashlib
 import re
-import io
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List
 
 import requests
 import chromadb
@@ -13,6 +12,8 @@ import PyPDF2
 import docx
 import openpyxl
 import chardet
+
+from sentence_transformers import SentenceTransformer
 
 
 # ============================================================
@@ -25,22 +26,27 @@ st.set_page_config(
     layout="wide"
 )
 
-# Ollama Cloud
+
+# ============================================================
+# CONFIGURACIÓN GENERAL
+# ============================================================
+
 OLLAMA_CLOUD_URL = "https://ollama.com"
 
-# Modelos Cloud
-# Puedes cambiarlos si tienes otro modelo disponible.
+# Modelo para generación de respuestas
 DEFAULT_CHAT_MODEL = "gpt-oss:20b"
-DEFAULT_EMBEDDING_MODEL = "qwen3-embedding"
 
-# RAG
+# Modelo LOCAL para embeddings
+DEFAULT_EMBEDDING_MODEL = (
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_NUM_CHUNKS = 5
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MEMORY_SIZE = 3
 
-# Límites para evitar que Streamlit Cloud tarde demasiado
 MAX_FILE_SIZE_MB = 25
 MAX_SUMMARY_CHARS = 12000
 
@@ -50,26 +56,25 @@ MAX_SUMMARY_CHARS = 12000
 # ============================================================
 
 def get_ollama_api_key():
-    """
-    Obtiene la API Key desde Streamlit Secrets.
-    Si no existe, intenta obtenerla desde variables de entorno.
-    """
 
     try:
-        key = st.secrets.get("OLLAMA_API_KEY")
+
+        key = st.secrets.get(
+            "OLLAMA_API_KEY"
+        )
 
         if key:
             return key
+
     except Exception:
         pass
 
-    return os.getenv("OLLAMA_API_KEY")
+    return os.getenv(
+        "OLLAMA_API_KEY"
+    )
 
 
 def get_ollama_headers():
-    """
-    Headers necesarios para Ollama Cloud.
-    """
 
     api_key = get_ollama_api_key()
 
@@ -83,17 +88,20 @@ def get_ollama_headers():
 
 
 def validate_ollama_key():
-    """
-    Verifica que exista la API Key.
-    No realiza llamadas innecesarias a /api/tags.
-    """
 
     key = get_ollama_api_key()
 
     if not key:
-        return False, "No se encontró OLLAMA_API_KEY en Streamlit Secrets."
 
-    return True, "API Key encontrada."
+        return (
+            False,
+            "No se encontró OLLAMA_API_KEY."
+        )
+
+    return (
+        True,
+        "API Key encontrada."
+    )
 
 
 # ============================================================
@@ -106,23 +114,21 @@ def ollama_chat(
     temperature: float = 0.1,
     stream: bool = False
 ):
-    """
-    Llama directamente a Ollama Cloud.
-
-    Endpoint:
-        https://ollama.com/api/chat
-    """
 
     headers = get_ollama_headers()
 
     if not headers:
+
         st.error(
-            "No se encontró OLLAMA_API_KEY. "
-            "Agrega OLLAMA_API_KEY en Streamlit Secrets."
+            "No se encontró OLLAMA_API_KEY "
+            "en Streamlit Secrets."
         )
+
         return None
 
-    url = f"{OLLAMA_CLOUD_URL}/api/chat"
+    url = (
+        f"{OLLAMA_CLOUD_URL}/api/chat"
+    )
 
     payload = {
         "model": model,
@@ -155,93 +161,12 @@ def ollama_chat(
         error_text = ""
 
         try:
-            error_text = response.text[:1000]
+            error_text = response.text[:2000]
         except Exception:
             pass
 
         st.error(
-            f"Error HTTP de Ollama Cloud: {e}\n\n"
-            f"{error_text}"
-        )
-
-        return None
-
-    except requests.exceptions.RequestException as e:
-
-        st.error(
-            f"No se pudo conectar con Ollama Cloud:\n{e}"
-        )
-
-        return None
-
-
-# ============================================================
-# EMBEDDINGS
-# ============================================================
-
-def embed_texts(
-    model: str,
-    texts: List[str]
-):
-    """
-    Genera embeddings en una sola llamada usando /api/embed.
-
-    Esto es mucho más eficiente que hacer una petición HTTP
-    independiente para cada chunk.
-    """
-
-    if not texts:
-        return []
-
-    headers = get_ollama_headers()
-
-    if not headers:
-        st.error("No existe OLLAMA_API_KEY.")
-        return None
-
-    url = f"{OLLAMA_CLOUD_URL}/api/embed"
-
-    payload = {
-        "model": model,
-        "input": texts
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=300
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        embeddings = data.get("embeddings")
-
-        if not embeddings:
-
-            st.error(
-                "Ollama Cloud no devolvió embeddings."
-            )
-
-            return None
-
-        return embeddings
-
-    except requests.exceptions.HTTPError as e:
-
-        error_text = ""
-
-        try:
-            error_text = response.text[:1000]
-        except Exception:
-            pass
-
-        st.error(
-            f"Error HTTP generando embeddings:\n"
+            f"Error HTTP de Ollama Cloud:\n\n"
             f"{e}\n\n"
             f"{error_text}"
         )
@@ -251,83 +176,152 @@ def embed_texts(
     except requests.exceptions.RequestException as e:
 
         st.error(
-            f"Error generando embeddings:\n{e}"
+            f"Error conectando con Ollama Cloud:\n\n{e}"
+        )
+
+        return None
+
+
+# ============================================================
+# MODELO DE EMBEDDINGS
+# ============================================================
+
+@st.cache_resource(
+    show_spinner="Cargando modelo de embeddings..."
+)
+def load_embedding_model():
+
+    return SentenceTransformer(
+        DEFAULT_EMBEDDING_MODEL
+    )
+
+
+def embed_texts(
+    texts: List[str]
+):
+
+    if not texts:
+        return []
+
+    try:
+
+        model = load_embedding_model()
+
+        embeddings = model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+
+        return embeddings.tolist()
+
+    except Exception as e:
+
+        st.error(
+            f"Error generando embeddings: {e}"
         )
 
         return None
 
 
 def embed_text(
-    model: str,
     text: str
 ):
-    """
-    Embedding de una sola consulta.
-    """
 
-    result = embed_texts(
-        model,
+    embeddings = embed_texts(
         [text]
     )
 
-    if not result:
+    if not embeddings:
+
         return None
 
-    return result[0]
+    return embeddings[0]
 
 
 # ============================================================
-# LECTURA DE ARCHIVOS
+# LECTURA DE PDF
 # ============================================================
 
 def read_pdf(file):
+
     text_parts = []
 
     try:
 
-        reader = PyPDF2.PdfReader(file)
+        reader = PyPDF2.PdfReader(
+            file
+        )
 
         for page in reader.pages:
 
             page_text = page.extract_text()
 
             if page_text:
-                text_parts.append(page_text)
 
-        return "\n".join(text_parts)
+                text_parts.append(
+                    page_text
+                )
+
+        return "\n".join(
+            text_parts
+        )
 
     except Exception as e:
 
         st.error(
-            f"Error leyendo PDF {file.name}: {e}"
+            f"Error leyendo PDF "
+            f"{file.name}: {e}"
         )
 
         return ""
 
+
+# ============================================================
+# LECTURA DE WORD
+# ============================================================
 
 def read_docx(file):
+
     try:
 
-        document = docx.Document(file)
+        document = docx.Document(
+            file
+        )
 
-        paragraphs = [
-            p.text
-            for p in document.paragraphs
-            if p.text.strip()
-        ]
+        paragraphs = []
 
-        return "\n".join(paragraphs)
+        for paragraph in document.paragraphs:
+
+            text = paragraph.text.strip()
+
+            if text:
+
+                paragraphs.append(
+                    text
+                )
+
+        return "\n".join(
+            paragraphs
+        )
 
     except Exception as e:
 
         st.error(
-            f"Error leyendo DOCX {file.name}: {e}"
+            f"Error leyendo DOCX "
+            f"{file.name}: {e}"
         )
 
         return ""
 
 
+# ============================================================
+# LECTURA DE EXCEL
+# ============================================================
+
 def read_excel(file):
+
     try:
 
         workbook = openpyxl.load_workbook(
@@ -341,32 +335,46 @@ def read_excel(file):
         for sheet in workbook.worksheets:
 
             text_parts.append(
-                f"\n--- HOJA: {sheet.title} ---\n"
+                f"\n--- HOJA: {sheet.title} ---"
             )
 
-            for row in sheet.iter_rows(values_only=True):
+            for row in sheet.iter_rows(
+                values_only=True
+            ):
 
-                values = [
-                    str(value)
-                    for value in row
-                    if value is not None
-                ]
+                values = []
+
+                for value in row:
+
+                    if value is not None:
+
+                        values.append(
+                            str(value)
+                        )
 
                 if values:
+
                     text_parts.append(
                         " | ".join(values)
                     )
 
-        return "\n".join(text_parts)
+        return "\n".join(
+            text_parts
+        )
 
     except Exception as e:
 
         st.error(
-            f"Error leyendo Excel {file.name}: {e}"
+            f"Error leyendo Excel "
+            f"{file.name}: {e}"
         )
 
         return ""
 
+
+# ============================================================
+# LECTURA DE TXT / CSV
+# ============================================================
 
 def read_text_file(file):
 
@@ -374,7 +382,9 @@ def read_text_file(file):
 
         raw_data = file.read()
 
-        detected = chardet.detect(raw_data)
+        detected = chardet.detect(
+            raw_data
+        )
 
         encoding = detected.get(
             "encoding",
@@ -389,47 +399,66 @@ def read_text_file(file):
     except Exception as e:
 
         st.error(
-            f"Error leyendo {file.name}: {e}"
+            f"Error leyendo "
+            f"{file.name}: {e}"
         )
 
         return ""
 
 
+# ============================================================
+# SELECTOR DE LECTOR
+# ============================================================
+
 def read_uploaded_file(file):
 
-    extension = Path(file.name).suffix.lower()
+    extension = (
+        Path(file.name)
+        .suffix
+        .lower()
+    )
 
     if extension == ".pdf":
 
         return read_pdf(file)
 
-    elif extension == ".docx":
+    if extension == ".docx":
 
         return read_docx(file)
 
-    elif extension in [".xlsx", ".xlsm", ".xltx"]:
+    if extension in [
+        ".xlsx",
+        ".xlsm",
+        ".xltx"
+    ]:
 
         return read_excel(file)
 
-    elif extension in [".txt", ".csv", ".md"]:
+    if extension in [
+        ".txt",
+        ".csv",
+        ".md"
+    ]:
 
         return read_text_file(file)
 
-    else:
-
-        return read_text_file(file)
+    return read_text_file(file)
 
 
 # ============================================================
-# LIMPIEZA DEL TEXTO
+# LIMPIEZA DE TEXTO
 # ============================================================
 
-def clean_text(text: str):
+def clean_text(text):
 
     if not text:
+
         return ""
 
-    text = text.replace("\x00", " ")
+    text = text.replace(
+        "\x00",
+        " "
+    )
 
     text = re.sub(
         r"[ \t]+",
@@ -451,14 +480,17 @@ def clean_text(text: str):
 # ============================================================
 
 def create_chunks(
-    text: str,
-    chunk_size: int,
-    chunk_overlap: int
+    text,
+    chunk_size,
+    chunk_overlap
 ):
 
-    text = clean_text(text)
+    text = clean_text(
+        text
+    )
 
     if not text:
+
         return []
 
     if chunk_overlap >= chunk_size:
@@ -470,7 +502,10 @@ def create_chunks(
     chunks = []
 
     start = 0
-    text_length = len(text)
+
+    text_length = len(
+        text
+    )
 
     while start < text_length:
 
@@ -479,21 +514,30 @@ def create_chunks(
             text_length
         )
 
-        chunk = text[start:end].strip()
+        chunk = text[
+            start:end
+        ].strip()
 
         if chunk:
-            chunks.append(chunk)
+
+            chunks.append(
+                chunk
+            )
 
         if end >= text_length:
+
             break
 
-        start = end - chunk_overlap
+        start = (
+            end -
+            chunk_overlap
+        )
 
     return chunks
 
 
 # ============================================================
-# HASH DE ARCHIVOS
+# HASH DE ARCHIVO
 # ============================================================
 
 def get_file_hash(file):
@@ -504,37 +548,44 @@ def get_file_hash(file):
 
     file.seek(0)
 
-    return hashlib.md5(content).hexdigest()
+    return hashlib.md5(
+        content
+    ).hexdigest()
 
 
 # ============================================================
-# RESUMEN DE DOCUMENTOS
+# RESUMEN DEL DOCUMENTO
 # ============================================================
 
 def summarize_document(
-    model: str,
-    text: str
+    model,
+    text
 ):
 
     if not text:
+
         return ""
 
-    # Evita enviar documentos enormes
-    text_for_summary = text[:MAX_SUMMARY_CHARS]
+    text_for_summary = (
+        text[:MAX_SUMMARY_CHARS]
+    )
 
     prompt = f"""
-Eres un asistente especializado en análisis documental.
+Eres un asistente especializado
+en análisis documental.
 
-Resume el siguiente documento de forma concisa.
+Resume el siguiente documento
+de manera concisa.
 
-Incluye:
+Incluye cuando estén disponibles:
+
 - Tema principal
 - Información importante
 - Datos relevantes
 - Procesos
 - Fechas
 - Personas o áreas involucradas
-- Conclusiones importantes
+- Conclusiones
 
 No inventes información.
 
@@ -551,6 +602,7 @@ DOCUMENTO:
     )
 
     if response is None:
+
         return ""
 
     try:
@@ -573,7 +625,7 @@ DOCUMENTO:
 
 
 # ============================================================
-# KEYWORD SEARCH
+# TOKENIZACIÓN
 # ============================================================
 
 def tokenize(text):
@@ -586,54 +638,79 @@ def tokenize(text):
     )
 
 
+# ============================================================
+# KEYWORD SCORE
+# ============================================================
+
 def keyword_score(
-    query: str,
-    document: str
+    query,
+    document
 ):
 
-    query_words = tokenize(query)
-    document_words = tokenize(document)
+    query_words = tokenize(
+        query
+    )
+
+    document_words = tokenize(
+        document
+    )
 
     if not query_words:
+
         return 0.0
 
     intersection = (
-        query_words & document_words
+        query_words &
+        document_words
     )
 
-    return len(intersection) / len(
-        query_words
+    return (
+        len(intersection) /
+        len(query_words)
     )
 
 
 # ============================================================
-# NORMALIZACIÓN
+# NORMALIZAR SCORES
 # ============================================================
 
-def normalize_scores(scores):
+def normalize_scores(
+    scores
+):
 
     if not scores:
+
         return []
 
-    minimum = min(scores)
-    maximum = max(scores)
+    minimum = min(
+        scores
+    )
+
+    maximum = max(
+        scores
+    )
 
     if maximum == minimum:
 
         return [
-            1.0 if maximum > 0 else 0.0
+            1.0 if maximum > 0
+            else 0.0
             for _ in scores
         ]
 
     return [
-        (score - minimum) /
-        (maximum - minimum)
+        (
+            score - minimum
+        ) /
+        (
+            maximum - minimum
+        )
         for score in scores
     ]
 
 
 # ============================================================
-# CHROMADB
+# CREAR CHROMADB
 # ============================================================
 
 def create_vector_collection():
@@ -644,7 +721,6 @@ def create_vector_collection():
         "simplerag_collection"
     )
 
-    # Si existe, eliminarla
     try:
 
         client.delete_collection(
@@ -652,6 +728,7 @@ def create_vector_collection():
         )
 
     except Exception:
+
         pass
 
     collection = client.create_collection(
@@ -662,18 +739,19 @@ def create_vector_collection():
 
 
 # ============================================================
-# PROCESAMIENTO RAG
+# PROCESAR DOCUMENTOS
 # ============================================================
 
 def process_documents(
     uploaded_files,
-    embedding_model,
     chat_model,
     chunk_size,
     chunk_overlap
 ):
 
-    collection = create_vector_collection()
+    collection = (
+        create_vector_collection()
+    )
 
     all_chunks = []
     all_metadata = []
@@ -682,7 +760,9 @@ def process_documents(
     summaries = {}
     documents_info = []
 
-    progress = st.progress(0)
+    progress = st.progress(
+        0
+    )
 
     total_files = len(
         uploaded_files
@@ -692,9 +772,9 @@ def process_documents(
         uploaded_files
     ):
 
-        # ----------------------------------------
-        # Tamaño
-        # ----------------------------------------
+        # ----------------------------------------------------
+        # Validar tamaño
+        # ----------------------------------------------------
 
         file.seek(0)
 
@@ -712,22 +792,23 @@ def process_documents(
 
             st.warning(
                 f"{file.name} supera "
-                f"{MAX_FILE_SIZE_MB} MB y fue omitido."
+                f"{MAX_FILE_SIZE_MB} MB "
+                f"y fue omitido."
             )
 
             continue
 
-        # ----------------------------------------
+        # ----------------------------------------------------
         # Hash
-        # ----------------------------------------
+        # ----------------------------------------------------
 
         file_hash = get_file_hash(
             file
         )
 
-        # ----------------------------------------
-        # Lectura
-        # ----------------------------------------
+        # ----------------------------------------------------
+        # Leer documento
+        # ----------------------------------------------------
 
         with st.spinner(
             f"Leyendo {file.name}..."
@@ -737,22 +818,25 @@ def process_documents(
                 file
             )
 
-        text = clean_text(text)
+        text = clean_text(
+            text
+        )
 
         if not text:
 
             st.warning(
-                f"No se encontró texto en {file.name}."
+                f"No se encontró texto "
+                f"en {file.name}."
             )
 
             continue
 
-        # ----------------------------------------
-        # Resumen
-        # ----------------------------------------
+        # ----------------------------------------------------
+        # Crear resumen
+        # ----------------------------------------------------
 
         with st.spinner(
-            f"Generando resumen de {file.name}..."
+            f"Analizando {file.name}..."
         ):
 
             summary = summarize_document(
@@ -760,11 +844,13 @@ def process_documents(
                 text
             )
 
-        summaries[file.name] = summary
+        summaries[
+            file.name
+        ] = summary
 
-        # ----------------------------------------
-        # Chunks
-        # ----------------------------------------
+        # ----------------------------------------------------
+        # Crear chunks
+        # ----------------------------------------------------
 
         chunks = create_chunks(
             text,
@@ -773,15 +859,23 @@ def process_documents(
         )
 
         documents_info.append({
+
             "name": file.name,
+
             "hash": file_hash,
-            "characters": len(text),
-            "chunks": len(chunks)
+
+            "characters": len(
+                text
+            ),
+
+            "chunks": len(
+                chunks
+            )
         })
 
-        # ----------------------------------------
-        # Guardar chunks
-        # ----------------------------------------
+        # ----------------------------------------------------
+        # Agregar chunks
+        # ----------------------------------------------------
 
         for chunk_index, chunk in enumerate(
             chunks
@@ -792,11 +886,17 @@ def process_documents(
                 f"{chunk_index}"
             )
 
-            all_chunks.append(chunk)
+            all_chunks.append(
+                chunk
+            )
 
             all_metadata.append({
-                "source": file.name,
-                "chunk": chunk_index
+
+                "source":
+                    file.name,
+
+                "chunk":
+                    chunk_index
             })
 
             all_ids.append(
@@ -804,7 +904,9 @@ def process_documents(
             )
 
         progress.progress(
-            (file_index + 1) /
+            (
+                file_index + 1
+            ) /
             total_files
         )
 
@@ -813,32 +915,37 @@ def process_documents(
     if not all_chunks:
 
         st.error(
-            "No se pudieron procesar documentos."
+            "No se pudieron procesar "
+            "los documentos."
         )
 
-        return None, {}, []
+        return (
+            None,
+            {},
+            []
+        )
 
     # ========================================================
-    # EMBEDDINGS
+    # EMBEDDINGS LOCALES
     # ========================================================
 
     st.info(
-        f"Generando embeddings para "
-        f"{len(all_chunks)} chunks..."
+        f"Generando embeddings locales "
+        f"para {len(all_chunks)} chunks..."
     )
 
-    # Una sola llamada por bloques.
-    # Esto evita cientos de requests individuales.
+    embedding_progress = st.progress(
+        0
+    )
 
     embeddings = []
 
     batch_size = 32
 
-    embedding_progress = st.progress(0)
-
     total_batches = (
         len(all_chunks) +
-        batch_size - 1
+        batch_size -
+        1
     ) // batch_size
 
     for batch_number, start in enumerate(
@@ -850,41 +957,52 @@ def process_documents(
     ):
 
         batch = all_chunks[
-            start:start + batch_size
+            start:
+            start + batch_size
         ]
 
         batch_embeddings = embed_texts(
-            embedding_model,
             batch
         )
 
         if not batch_embeddings:
 
             st.error(
-                "No se pudieron generar los embeddings."
+                "No se pudieron generar "
+                "los embeddings."
             )
 
-            return None, {}, []
+            return (
+                None,
+                {},
+                []
+            )
 
         embeddings.extend(
             batch_embeddings
         )
 
         embedding_progress.progress(
-            (batch_number + 1) /
+            (
+                batch_number + 1
+            ) /
             total_batches
         )
 
     embedding_progress.empty()
 
     # ========================================================
-    # CHROMA
+    # INSERTAR EN CHROMA
     # ========================================================
 
     collection.add(
+
         ids=all_ids,
+
         embeddings=embeddings,
+
         documents=all_chunks,
+
         metadatas=all_metadata
     )
 
@@ -902,7 +1020,6 @@ def process_documents(
 def hybrid_search(
     collection,
     query,
-    embedding_model,
     num_chunks
 ):
 
@@ -910,12 +1027,11 @@ def hybrid_search(
 
         return []
 
-    # ----------------------------------------
-    # Query embedding
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Embedding de la pregunta
+    # --------------------------------------------------------
 
     query_embedding = embed_text(
-        embedding_model,
         query
     )
 
@@ -923,24 +1039,34 @@ def hybrid_search(
 
         return []
 
-    # ----------------------------------------
-    # Solicitar solamente candidatos razonables
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Cantidad de candidatos
+    # --------------------------------------------------------
 
     collection_count = (
         collection.count()
     )
 
     candidate_count = min(
-        max(num_chunks * 4, 10),
+        max(
+            num_chunks * 4,
+            10
+        ),
         collection_count
     )
 
+    # --------------------------------------------------------
+    # Búsqueda vectorial
+    # --------------------------------------------------------
+
     results = collection.query(
+
         query_embeddings=[
             query_embedding
         ],
+
         n_results=candidate_count,
+
         include=[
             "documents",
             "metadatas",
@@ -949,53 +1075,76 @@ def hybrid_search(
     )
 
     documents = (
-        results.get("documents", [[]])[0]
+        results
+        .get(
+            "documents",
+            [[]]
+        )[0]
     )
 
     metadatas = (
-        results.get("metadatas", [[]])[0]
+        results
+        .get(
+            "metadatas",
+            [[]]
+        )[0]
     )
 
     distances = (
-        results.get("distances", [[]])[0]
+        results
+        .get(
+            "distances",
+            [[]]
+        )[0]
     )
 
     if not documents:
 
         return []
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Semantic score
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     semantic_scores = [
-        1 / (1 + distance)
+
+        1 /
+        (
+            1 + distance
+        )
+
         for distance in distances
     ]
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Keyword score
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     keyword_scores = [
+
         keyword_score(
             query,
             document
         )
+
         for document in documents
     ]
 
-    semantic_normalized = normalize_scores(
-        semantic_scores
+    semantic_normalized = (
+        normalize_scores(
+            semantic_scores
+        )
     )
 
-    keyword_normalized = normalize_scores(
-        keyword_scores
+    keyword_normalized = (
+        normalize_scores(
+            keyword_scores
+        )
     )
 
-    # ----------------------------------------
-    # Hybrid score
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Score híbrido
+    # --------------------------------------------------------
 
     combined = []
 
@@ -1004,23 +1153,37 @@ def hybrid_search(
     ):
 
         score = (
+
             0.70 *
             semantic_normalized[i]
+
             +
+
             0.30 *
             keyword_normalized[i]
         )
 
         combined.append({
-            "document": documents[i],
-            "metadata": metadatas[i],
-            "semantic_score": semantic_normalized[i],
-            "keyword_score": keyword_normalized[i],
-            "score": score
+
+            "document":
+                documents[i],
+
+            "metadata":
+                metadatas[i],
+
+            "semantic_score":
+                semantic_normalized[i],
+
+            "keyword_score":
+                keyword_normalized[i],
+
+            "score":
+                score
         })
 
     combined.sort(
-        key=lambda x: x["score"],
+        key=lambda x:
+            x["score"],
         reverse=True
     )
 
@@ -1030,7 +1193,7 @@ def hybrid_search(
 
 
 # ============================================================
-# PROMPT RAG
+# CONSTRUIR PROMPT RAG
 # ============================================================
 
 def build_rag_prompt(
@@ -1048,11 +1211,14 @@ def build_rag_prompt(
         start=1
     ):
 
-        source = item[
-            "metadata"
-        ].get(
-            "source",
-            "Documento"
+        source = (
+            item[
+                "metadata"
+            ]
+            .get(
+                "source",
+                "Documento"
+            )
         )
 
         context_parts.append(
@@ -1067,9 +1233,15 @@ def build_rag_prompt(
         context_parts
     )
 
+    # --------------------------------------------------------
+    # Resúmenes
+    # --------------------------------------------------------
+
     summary_text = ""
 
-    for filename, summary in summaries.items():
+    for filename, summary in (
+        summaries.items()
+    ):
 
         if summary:
 
@@ -1078,9 +1250,15 @@ def build_rag_prompt(
                 f"{summary}\n"
             )
 
+    # --------------------------------------------------------
+    # Historial
+    # --------------------------------------------------------
+
     history_text = ""
 
-    for message in chat_history[-6:]:
+    for message in (
+        chat_history[-6:]
+    ):
 
         role = message.get(
             "role",
@@ -1097,21 +1275,9 @@ def build_rag_prompt(
             f"{content}\n"
         )
 
-    if not prompt_template.strip():
-
-        prompt_template = """
-Responde la pregunta utilizando exclusivamente
-la información encontrada en los documentos.
-
-Si la información no está disponible,
-indica claramente que no se encuentra en
-los documentos proporcionados.
-
-No inventes datos.
-
-Responde en español de manera clara,
-profesional y concisa.
-"""
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     prompt = f"""
 {prompt_template}
@@ -1149,7 +1315,7 @@ RESPUESTA
 
 
 # ============================================================
-# PARSE STREAM
+# STREAM DE RESPUESTA OLLAMA
 # ============================================================
 
 def stream_ollama_response(
@@ -1159,6 +1325,7 @@ def stream_ollama_response(
     for line in response.iter_lines():
 
         if not line:
+
             continue
 
         try:
@@ -1182,6 +1349,7 @@ def stream_ollama_response(
             )
 
             if content:
+
                 yield content
 
         except Exception:
@@ -1207,15 +1375,13 @@ def initialize_session_state():
 
         "data_processed": False,
 
-        "embedding_model":
-            DEFAULT_EMBEDDING_MODEL,
-
         "chat_model":
-            DEFAULT_CHAT_MODEL,
-
+            DEFAULT_CHAT_MODEL
     }
 
-    for key, value in defaults.items():
+    for key, value in (
+        defaults.items()
+    ):
 
         if key not in st.session_state:
 
@@ -1233,11 +1399,13 @@ initialize_session_state()
 
 with st.sidebar:
 
-    st.header("⚙️ Configuración")
+    st.header(
+        "⚙️ Configuración"
+    )
 
-    # --------------------------------------------------------
-    # API
-    # --------------------------------------------------------
+    # ========================================================
+    # OLLAMA CLOUD
+    # ========================================================
 
     st.subheader(
         "☁️ Ollama Cloud"
@@ -1260,33 +1428,29 @@ with st.sidebar:
         )
 
     st.caption(
-        "La aplicación utiliza Ollama Cloud. "
-        "No necesita Ollama instalado en tu PC."
+        "Ollama Cloud se utiliza para "
+        "generar las respuestas."
     )
 
-    # --------------------------------------------------------
-    # MODELOS
-    # --------------------------------------------------------
+    # ========================================================
+    # MODELO CHAT
+    # ========================================================
 
     st.subheader(
-        "🤖 Modelos"
+        "🤖 Modelo de Chat"
     )
 
     chat_model = st.text_input(
-        "Modelo de Chat",
-        value=st.session_state.chat_model,
-        help=(
-            "Modelo utilizado para responder "
-            "las preguntas y crear resúmenes."
-        )
-    )
 
-    embedding_model = st.text_input(
-        "Modelo de Embeddings",
-        value=st.session_state.embedding_model,
+        "Modelo",
+
+        value=(
+            st.session_state.chat_model
+        ),
+
         help=(
-            "Modelo utilizado para convertir "
-            "los documentos en vectores."
+            "Modelo utilizado por "
+            "Ollama Cloud."
         )
     )
 
@@ -1294,92 +1458,130 @@ with st.sidebar:
         chat_model
     )
 
-    st.session_state.embedding_model = (
-        embedding_model
+    # ========================================================
+    # EMBEDDINGS
+    # ========================================================
+
+    st.subheader(
+        "🧠 Embeddings"
     )
 
-    # --------------------------------------------------------
-    # RAG
-    # --------------------------------------------------------
+    st.info(
+        "Embeddings locales:\n\n"
+        "all-MiniLM-L6-v2"
+    )
+
+    # ========================================================
+    # CONFIGURACIÓN RAG
+    # ========================================================
 
     st.subheader(
         "📚 Configuración RAG"
     )
 
     chunk_size = st.slider(
+
         "Tamaño del chunk",
+
         min_value=500,
+
         max_value=2000,
+
         value=DEFAULT_CHUNK_SIZE,
+
         step=100
     )
 
     chunk_overlap = st.slider(
+
         "Overlap",
+
         min_value=50,
+
         max_value=400,
+
         value=DEFAULT_CHUNK_OVERLAP,
+
         step=50
     )
 
     num_chunks = st.slider(
+
         "Chunks recuperados",
+
         min_value=2,
+
         max_value=10,
+
         value=DEFAULT_NUM_CHUNKS
     )
 
     temperature = st.slider(
+
         "Temperature",
+
         min_value=0.0,
+
         max_value=1.0,
+
         value=DEFAULT_TEMPERATURE,
+
         step=0.05
     )
 
     memory_size = st.slider(
-        "Memoria de conversación",
+
+        "Memoria",
+
         min_value=1,
+
         max_value=10,
+
         value=DEFAULT_MEMORY_SIZE
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # PROMPT
-    # --------------------------------------------------------
+    # ========================================================
 
     st.subheader(
         "📝 Prompt"
     )
 
     prompt_template = st.text_area(
-        "Instrucciones del asistente",
+
+        "Instrucciones",
+
         value="""
-Responde la pregunta utilizando exclusivamente
-la información encontrada en los documentos.
+Responde la pregunta utilizando
+exclusivamente la información encontrada
+en los documentos.
 
 Si la información no está disponible,
-indica claramente que no se encuentra en
-los documentos proporcionados.
+indica claramente que no se encuentra
+en los documentos proporcionados.
 
 No inventes datos.
 
 Responde en español de manera clara,
 profesional y concisa.
 """,
+
         height=180
     )
 
-    # --------------------------------------------------------
-    # ARCHIVOS
-    # --------------------------------------------------------
+    # ========================================================
+    # DOCUMENTOS
+    # ========================================================
 
     st.subheader(
         "📂 Documentos"
     )
 
     uploaded_files = st.file_uploader(
+
         "Sube tus documentos",
+
         type=[
             "pdf",
             "docx",
@@ -1389,17 +1591,27 @@ profesional y concisa.
             "csv",
             "md"
         ],
+
         accept_multiple_files=True
     )
 
     process_button = st.button(
+
         "🚀 Procesar documentos",
+
         type="primary",
+
         use_container_width=True
     )
 
+    # ========================================================
+    # LIMPIAR CHAT
+    # ========================================================
+
     if st.button(
+
         "🗑️ Limpiar conversación",
+
         use_container_width=True
     ):
 
@@ -1417,7 +1629,7 @@ if process_button:
     if not key_ok:
 
         st.error(
-            "Primero configura OLLAMA_API_KEY "
+            "Configura OLLAMA_API_KEY "
             "en Streamlit Secrets."
         )
 
@@ -1440,11 +1652,18 @@ if process_button:
             summaries,
             documents_info
         ) = process_documents(
-            uploaded_files=uploaded_files,
-            embedding_model=embedding_model,
-            chat_model=chat_model,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
+
+            uploaded_files=
+                uploaded_files,
+
+            chat_model=
+                chat_model,
+
+            chunk_size=
+                chunk_size,
+
+            chunk_overlap=
+                chunk_overlap
         )
 
     if collection is not None:
@@ -1471,7 +1690,7 @@ if process_button:
 
 
 # ============================================================
-# TÍTULO PRINCIPAL
+# TÍTULO
 # ============================================================
 
 st.title(
@@ -1479,30 +1698,42 @@ st.title(
 )
 
 st.caption(
-    "RAG documental con Streamlit + Ollama Cloud + ChromaDB"
+    "RAG documental con "
+    "Streamlit + Ollama Cloud + "
+    "Sentence Transformers + ChromaDB"
 )
 
 
 # ============================================================
-# ESTADO DEL SISTEMA
+# MÉTRICAS
 # ============================================================
 
 if st.session_state.data_processed:
 
     total_chunks = (
-        st.session_state.collection.count()
+
+        st.session_state
+        .collection
+        .count()
+
         if st.session_state.collection
+
         else 0
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3 = (
+        st.columns(3)
+    )
 
     with col1:
 
         st.metric(
+
             "Documentos",
+
             len(
-                st.session_state.documents_info
+                st.session_state
+                .documents_info
             )
         )
 
@@ -1516,13 +1747,13 @@ if st.session_state.data_processed:
     with col3:
 
         st.metric(
-            "Modelo",
+            "Modelo LLM",
             chat_model
         )
 
 
 # ============================================================
-# DOCUMENTOS PROCESADOS
+# DOCUMENTOS
 # ============================================================
 
 if st.session_state.documents_info:
@@ -1532,7 +1763,8 @@ if st.session_state.documents_info:
     ):
 
         for document in (
-            st.session_state.documents_info
+            st.session_state
+            .documents_info
         ):
 
             st.write(
@@ -1540,8 +1772,10 @@ if st.session_state.documents_info:
             )
 
             st.caption(
+
                 f"Caracteres: "
                 f"{document['characters']:,} | "
+
                 f"Chunks: "
                 f"{document['chunks']}"
             )
@@ -1554,8 +1788,8 @@ if st.session_state.documents_info:
 if not st.session_state.data_processed:
 
     st.info(
-        "👈 Sube uno o varios documentos "
-        "desde el panel lateral y presiona "
+        "👈 Sube documentos desde "
+        "el panel lateral y presiona "
         "**Procesar documentos**."
     )
 
@@ -1565,7 +1799,10 @@ else:
         "💬 Pregunta sobre tus documentos"
     )
 
-    # Mostrar historial
+    # --------------------------------------------------------
+    # Mostrar mensajes
+    # --------------------------------------------------------
+
     for message in (
         st.session_state.messages
     ):
@@ -1578,19 +1815,27 @@ else:
                 message["content"]
             )
 
+    # --------------------------------------------------------
+    # Input
+    # --------------------------------------------------------
+
     question = st.chat_input(
         "Escribe tu pregunta..."
     )
 
     if question:
 
-        # --------------------------------------------
-        # Usuario
-        # --------------------------------------------
+        # ====================================================
+        # MENSAJE USUARIO
+        # ====================================================
 
         st.session_state.messages.append({
-            "role": "user",
-            "content": question
+
+            "role":
+                "user",
+
+            "content":
+                question
         })
 
         with st.chat_message(
@@ -1601,9 +1846,9 @@ else:
                 question
             )
 
-        # --------------------------------------------
-        # Retrieval
-        # --------------------------------------------
+        # ====================================================
+        # RETRIEVAL
+        # ====================================================
 
         with st.spinner(
             "🔎 Buscando información relevante..."
@@ -1611,12 +1856,15 @@ else:
 
             retrieved_chunks = (
                 hybrid_search(
-                    collection=(
-                        st.session_state.collection
-                    ),
-                    query=question,
-                    embedding_model=embedding_model,
-                    num_chunks=num_chunks
+
+                    collection=
+                        st.session_state.collection,
+
+                    query=
+                        question,
+
+                    num_chunks=
+                        num_chunks
                 )
             )
 
@@ -1636,55 +1884,77 @@ else:
                 )
 
             st.session_state.messages.append({
-                "role": "assistant",
-                "content": answer
+
+                "role":
+                    "assistant",
+
+                "content":
+                    answer
             })
 
             st.stop()
 
-        # --------------------------------------------
-        # Prompt
-        # --------------------------------------------
+        # ====================================================
+        # CONSTRUIR PROMPT
+        # ====================================================
 
         prompt = build_rag_prompt(
-            question=question,
-            retrieved_chunks=retrieved_chunks,
-            summaries=(
-                st.session_state.summaries
-            ),
-            chat_history=(
+
+            question=
+                question,
+
+            retrieved_chunks=
+                retrieved_chunks,
+
+            summaries=
+                st.session_state.summaries,
+
+            chat_history=
                 st.session_state.messages[
                     -(memory_size * 2):
-                ]
-            ),
-            prompt_template=prompt_template
+                ],
+
+            prompt_template=
+                prompt_template
         )
 
-        # --------------------------------------------
-        # Chat Cloud
-        # --------------------------------------------
+        # ====================================================
+        # OLLAMA CLOUD
+        # ====================================================
 
         with st.chat_message(
             "assistant"
         ):
 
             response = ollama_chat(
-                model=chat_model,
-                prompt=prompt,
-                temperature=temperature,
-                stream=True
+
+                model=
+                    chat_model,
+
+                prompt=
+                    prompt,
+
+                temperature=
+                    temperature,
+
+                stream=
+                    True
             )
 
             if response is None:
 
                 st.stop()
 
-            answer_placeholder = st.empty()
+            answer_placeholder = (
+                st.empty()
+            )
 
             answer = ""
 
-            for token in stream_ollama_response(
-                response
+            for token in (
+                stream_ollama_response(
+                    response
+                )
             ):
 
                 answer += token
@@ -1693,33 +1963,43 @@ else:
                     answer
                 )
 
-        # --------------------------------------------
-        # Guardar respuesta
-        # --------------------------------------------
+        # ====================================================
+        # GUARDAR RESPUESTA
+        # ====================================================
 
         st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer
+
+            "role":
+                "assistant",
+
+            "content":
+                answer
         })
 
-        # --------------------------------------------
-        # Fuentes
-        # --------------------------------------------
+        # ====================================================
+        # FUENTES
+        # ====================================================
 
         with st.expander(
             "🔎 Ver información recuperada"
         ):
 
             for index, item in enumerate(
+
                 retrieved_chunks,
+
                 start=1
             ):
 
-                source = item[
-                    "metadata"
-                ].get(
-                    "source",
-                    "Documento"
+                source = (
+
+                    item[
+                        "metadata"
+                    ]
+                    .get(
+                        "source",
+                        "Documento"
+                    )
                 )
 
                 score = item[
@@ -1749,5 +2029,7 @@ else:
 st.divider()
 
 st.caption(
-    "SimpleRAG • Streamlit Cloud • Ollama Cloud • ChromaDB"
+    "SimpleRAG • Streamlit Cloud • "
+    "Ollama Cloud • Sentence Transformers • "
+    "ChromaDB"
 )
